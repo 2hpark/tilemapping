@@ -16,9 +16,6 @@
 //   data/obstacles.json — obstacle positions in world coordinates
 // ============================================================
 
-let WORLD_W; // total world width in pixels
-let WORLD_H; // total world height in pixels
-
 // ------------------------------------------------------------
 // CAMERA
 // camX and camY are the world coordinates at the top-left
@@ -33,7 +30,9 @@ let camZoom = 0.7;
 // ------------------------------------------------------------
 // PLAYER CONFIGURATION
 // ------------------------------------------------------------
-const PLAYER_SPEED = 35;
+const PLAYER_SPEED = 15;
+let moveSpeed = PLAYER_SPEED;
+const INVINCIBLE_FRAMES = 90; // ADDED — was referenced but never defined
 
 // ------------------------------------------------------------
 // PLAYER
@@ -41,8 +40,8 @@ const PLAYER_SPEED = 35;
 // Starts near the bottom centre of the world.
 // ------------------------------------------------------------
 let player = {
-  x: 1,
-  y: 1,
+  x: 15000,
+  y: 3000,
   r: 22,
   blobT: 0,
   direction: { x: 0, y: -1 },
@@ -72,7 +71,47 @@ let obstacleData;
 let obstacles = [];
 
 let tileData;
+let tiles = [];
+
+let waterTiles = [];
+let seaweedImg;
+let sandImg;
+let sandrockImg;
+let rockImg;
+let spike1Img;
+let spike2Img;
+let spike3Img;
+let spike4Img;
+let fishareaBG;
+
 let fishArea;
+
+// ------------------------------------------------------------
+// ADDED — TILE PHYSICS
+// Tiles are grouped by *behaviour* rather than by raw id, since
+// the same id number means different things on different layers.
+// Add/rename layer names here to match your map.json exactly.
+// ------------------------------------------------------------
+const SOLID_LAYERS = ["rock", "seaweed"]; // blocks movement CHANGE SEAWEED PROPERTES
+const HAZARD_LAYERS = ["spikes"]; // kills on contact
+const CHECKPOINT_LAYER = "checkpoint"; // respawn points
+const COLLECTABLE_LAYER = "coins";
+const WHIRLPOOL_LAYER = "whirlpool";
+// "water" and "bg green" (and anything else) are treated as pure
+// background — they're drawn but never checked for collision.
+
+let solidTiles = []; // [{x,y,w,h}] world-space rects — rock + seaweed
+let hazardTiles = []; // [{x,y,w,h}] world-space rects — spikes
+let checkpoints = []; // [{x,y,w,h,spawnX,spawnY}] grouped checkpoint zones, sorted left→right
+let activeCheckpointIndex = -1; // index into `checkpoints` of the furthest one reached
+let lastCheckpoint = null; // {x,y} world coords the player respawns at
+let playerStart = { x: 0, y: 0 }; // fallback spawn if no checkpoint reached yet
+let coinMap = new Map(); // key: "tx,ty" -> collected boolean
+let coinsTotal = 0;
+let coinsCollected = 0;
+let whirlpoolTiles = []; // [{x,y,w,h}]
+let allCoinsCollected = false;
+
 // ------------------------------------------------------------
 // WAVE SYSTEM
 // Each wave has a triggerY — spawns when player.y < triggerY.
@@ -80,6 +119,14 @@ let fishArea;
 // ------------------------------------------------------------
 let enemyData;
 let nextWave = 0;
+
+// ------------------------------------------------------------
+// BOSS
+// Spawns when player enters the boss zone (player.y < bossZoneY).
+// ------------------------------------------------------------
+let boss = null;
+let bossData = null;
+const BOSS_ZONE_Y = 300; // world Y — enter this zone to trigger boss
 
 // ------------------------------------------------------------
 // MINIMAP
@@ -120,9 +167,17 @@ let gameState = STATE_PLAY;
 function preload() {
   enemyData = loadJSON("data/enemies.json");
   obstacleData = loadJSON("data/obstacles.json");
-  tileData = loadJSON("data/map.json"); // fix naming convention
+  tileData = loadJSON("data/map.json");
   fishArea = loadJSON("data/fisharea.json");
-  // humanArea 
+  seaweedImg = loadImage("assets/seaweed.png");
+  sandImg = loadImage("assets/sand.png");
+  sandrockImg = loadImage("assets/sandrock.png");
+  rockImg = loadImage("assets/rock.png");
+  spike1Img = loadImage("assets/spike1.png");
+  spike2Img = loadImage("assets/spike2.png");
+  spike3Img = loadImage("assets/spike3.png");
+  spike4Img = loadImage("assets/spike4.png");
+  fishareaBG = loadImage("assets/fishareaBG.png");
 
   // Uncomment to load sounds:
   // shootSound     = loadSound("assets/sounds/shoot.wav");
@@ -134,11 +189,6 @@ function preload() {
   // music          = loadSound("assets/sounds/music.mp3");
 }
 
-// ------------------------------------------------------------
-// WORLD
-// The world is larger than the canvas. The camera follows
-// the player so only part of the world is visible at once.
-// ------------------------------------------------------------
 const TILE_SIZE = 50;
 
 // ============================================================
@@ -148,12 +198,29 @@ function setup() {
   createCanvas(800, 450);
   WORLD_W = TILE_SIZE * (tileData.mapWidth + fishArea.mapWidth); // total world width in pixels
   WORLD_H = TILE_SIZE * (tileData.mapHeight + fishArea.mapHeight); // total world height in pixels
+  bossData = enemyData.boss;
+  console.log("tileData=", tileData);
+  console.log("obstacleData=", obstacleData);
 
   // Build obstacle objects from JSON
   for (let i = 0; i < obstacleData.obstacles.length; i++) {
     let o = obstacleData.obstacles[i];
     obstacles.push({ x: o.x, y: o.y, size: o.size });
   }
+
+  const tilesArray = tileData.layers?.[0]?.tiles || [];
+  for (let i = 0; i < tilesArray.length; i++) {
+    const t = tilesArray[i];
+    tiles.push({ x: t.x, y: t.y, id: t.id });
+  }
+
+  // ADDED — sort solid/hazard/checkpoint tiles out of every layer
+  // and group checkpoint tiles into discrete zones.
+  buildTileCollision();
+
+  // ADDED — remember the player's starting point as the fallback
+  // respawn location for before any checkpoint has been reached.
+  playerStart = { x: player.x, y: player.y };
 
   // Start camera so player is visible
   camX = player.x - width / 2;
@@ -168,9 +235,10 @@ function setup() {
 // ============================================================
 function draw() {
   background(20);
-  print("player x: " + player.x / 50 + ", player y: " + player.y / 50);
+  console.log(player.x / 50, player.y / 50); // for troubleshooting
 
   updateCamera();
+  updateInvincibility(); // ADDED — ticks down player.invincibleTimer
 
   // Everything inside push/pop is drawn in world coordinates
   push();
@@ -181,19 +249,28 @@ function draw() {
 
   drawBackground();
 
-  // if player 3/4 into bird area - IT DRAWS IT, NOT LOADS which can be fixed later
-  if (player.x > ((TILE_SIZE * tileData.mapWidth) / 4) * 3) {
+  // if player is near y lvel of fish area
+  if (player.y > TILE_SIZE * (tileData.mapHeight - tileData.mapHeight / 7)) {
     // add end of fish area boundary later
     drawTiles(fishArea); // fish area
-    console.log("fish area drawn"); 
+    console.log("fish area drawn");
   }
 
   if (gameState === STATE_PLAY) {
+    updateMoveSpeed();
     handleInput();
     applyBounce();
 
+    // ADDED — tile physics: solid blockage, hazards, checkpoints
+    resolveSolidCollisions();
+    checkWhirlpools();
+    checkCollectables();
+    checkHazardCollisions();
+    checkCheckpoints();
+    checkObstaclePlayerCollision(); // was defined but never called
+
     drawObstacles();
-    drawTiles(tileData); // bird area
+    drawTiles(tileData);
 
     drawPlayer();
   }
@@ -202,7 +279,6 @@ function draw() {
 
   drawMinimap();
 }
-
 // ------------------------------------------------------------
 // updateCamera()
 // Smoothly moves the camera toward the player each frame.
@@ -222,45 +298,549 @@ function updateCamera() {
   camY = lerp(camY, targetY, CAM_SMOOTHING);
 }
 
-function drawTiles(jsonFile) {
-  const layers = jsonFile.layers;
-  for (let l = layers.length - 1; l > -1; l--) {
-    // for each layer we will....
-    if (layers[l].name === "spikes") {
-      fill("orange"); // there are 4 spike subtypes
-    } else if (layers[l].name === "rock") {
-      fill(0);
-    } else if (layers[l].name == "background rock") {
-      fill(150);
-    } else if (layers[l].name === "background sky") {
-      fill(200, 230, 255);
-    } else if (layers[l].name === "checkpoint") {
-      fill("pink");
-    } else if (layers[l].name === "water") {
-      fill(0, 0, 240);
-    } else if (layers[l].name === "key") {
-      fill("yellow");
-    } else if (layers[l].name === "seaweed") {
-      fill("green");
-    } else if (layers[l].name === "whirlpool") {
-      fill(80);
-    } else if (layers[l].name === "sand") {
-      fill(250, 250, 200);
-    } else if (layers[l].name === "wind") {
-      fill(255);
+// ------------------------------------------------------------
+// ADDED — updateInvincibility()
+// Counts down the player's invincibility window after taking a
+// hit (from spikes or obstacles) and clears the flag at zero.
+// If you already decrement invincibleTimer somewhere else in your
+// full project, remove this function to avoid double-counting.
+// ------------------------------------------------------------
+function updateInvincibility() {
+  if (player.invincible) {
+    player.invincibleTimer--;
+    if (player.invincibleTimer <= 0) {
+      player.invincible = false;
+      player.invincibleTimer = 0;
+    }
+  }
+}
+
+// ============================================================
+// ADDED — TILE PHYSICS
+// ============================================================
+
+// ------------------------------------------------------------
+// processJsonLayers()
+// Helper function to extract and categorize tiles from a JSON
+// file's layers. Can be called for tileData, fishArea, or any
+// other future JSON files to build a unified collision system.
+// Applies world offsets so fishArea tiles are positioned correctly.
+// ------------------------------------------------------------
+function processJsonLayers(
+  jsonFile,
+  checkpointTiles,
+  coinTiles,
+  offsetX = 0,
+  offsetY = 0,
+) {
+  if (!jsonFile || !jsonFile.layers) return;
+
+  for (const layer of jsonFile.layers) {
+    const isWater = layer.name === "water";
+    const isSolid = SOLID_LAYERS.includes(layer.name);
+    const isHazard = HAZARD_LAYERS.includes(layer.name);
+    const isCheckpoint = layer.name === CHECKPOINT_LAYER;
+    const isCoin = layer.name === COLLECTABLE_LAYER;
+    const isWhirlpool = layer.name === WHIRLPOOL_LAYER;
+
+    if (
+      !isSolid &&
+      !isHazard &&
+      !isCheckpoint &&
+      !isCoin &&
+      !isWhirlpool &&
+      !isWater
+    )
+      continue;
+
+    for (const t of layer.tiles) {
+      const rect = {
+        x: t.x * TILE_SIZE + offsetX,
+        y: t.y * TILE_SIZE + offsetY,
+        w: TILE_SIZE,
+        h: TILE_SIZE,
+        tx: t.x,
+        ty: t.y,
+      };
+      if (isSolid) solidTiles.push(rect);
+      else if (isHazard) hazardTiles.push(rect);
+      else if (isCheckpoint) checkpointTiles.push(rect);
+      else if (isCoin) coinTiles.push(rect);
+      else if (isWhirlpool) whirlpoolTiles.push(rect);
+      else if (isWater) waterTiles.push(rect);
+    }
+  }
+}
+
+// ============================================================
+// ADDED — TILE PHYSICS
+// ============================================================
+
+// ------------------------------------------------------------
+// buildTileCollision()
+// Walks every layer in tileData once, sorting tiles into
+// solidTiles / hazardTiles / raw checkpoint tiles based on the
+// layer's name. Called once from setup(). Call it again if you
+// ever swap tileData for a different scene/map at runtime.
+// ------------------------------------------------------------
+function buildTileCollision() {
+  solidTiles = [];
+  hazardTiles = [];
+  const checkpointTiles = [];
+  const coinTiles = [];
+  whirlpoolTiles = [];
+  waterTiles = [];
+
+  // Process layers from tileData (no offset)
+  processJsonLayers(tileData, checkpointTiles, coinTiles, 0, 0);
+
+  // Process layers from fishArea with world offsets
+  const fishAreaOffsetX = TILE_SIZE * (tileData.mapWidth - 33);
+  const fishAreaOffsetY = TILE_SIZE * tileData.mapHeight;
+  processJsonLayers(
+    fishArea,
+    checkpointTiles,
+    coinTiles,
+    fishAreaOffsetX,
+    fishAreaOffsetY,
+  );
+
+  function playerInWater() {
+    for (const t of waterTiles) {
+      const closestX = constrain(player.x, t.x, t.x + t.w);
+      const closestY = constrain(player.y, t.y, t.y + t.h);
+
+      if (dist(player.x, player.y, closestX, closestY) < player.r) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  checkpoints = groupCheckpointTiles(checkpointTiles);
+  // register coins
+  coinMap = new Map();
+  coinsTotal = coinTiles.length;
+  coinsCollected = 0;
+  for (const c of coinTiles) {
+    const k = c.tx + "," + c.ty;
+    coinMap.set(k, false);
+  }
+}
+
+// ------------------------------------------------------------
+// groupCheckpointTiles()
+// Checkpoint tiles are usually placed as a small cluster (a
+// flag/banner a few tiles wide). This flood-fills adjacent
+// checkpoint tiles into a single zone so touching ANY tile in
+// the cluster counts as reaching that checkpoint, and gives each
+// zone one spawn point (top-centre of the cluster).
+// ------------------------------------------------------------
+function groupCheckpointTiles(tileRects) {
+  const key = (tx, ty) => tx + "," + ty;
+  const lookup = new Map();
+  for (const r of tileRects) lookup.set(key(r.tx, r.ty), r);
+
+  const visited = new Set();
+  const groups = [];
+
+  for (const start of tileRects) {
+    const startKey = key(start.tx, start.ty);
+    if (visited.has(startKey)) continue;
+
+    const queue = [start];
+    visited.add(startKey);
+    const cluster = [];
+
+    while (queue.length) {
+      const cur = queue.shift();
+      cluster.push(cur);
+
+      const neighbours = [
+        [cur.tx + 1, cur.ty],
+        [cur.tx - 1, cur.ty],
+        [cur.tx, cur.ty + 1],
+        [cur.tx, cur.ty - 1],
+      ];
+      for (const [nx, ny] of neighbours) {
+        const nk = key(nx, ny);
+        if (lookup.has(nk) && !visited.has(nk)) {
+          visited.add(nk);
+          queue.push(lookup.get(nk));
+        }
+      }
     }
 
-    for (let i = 0; i < layers[l].tiles.length; i++) {
-      let t = layers[l].tiles[i]; // for every tile we will....
+    let minX = Infinity,
+      minY = Infinity,
+      maxX = -Infinity,
+      maxY = -Infinity;
+    for (const c of cluster) {
+      minX = Math.min(minX, c.x);
+      minY = Math.min(minY, c.y);
+      maxX = Math.max(maxX, c.x + c.w);
+      maxY = Math.max(maxY, c.y + c.h);
+    }
 
-      if (
-        // skip drawing if offscreen - this is broken lowk
-        t.x + t.size < camX ||
-        t.x - t.size > camX + width ||
-        t.y + t.size < camY ||
-        t.y - t.size > camY + height
-      )
-        continue;
+    groups.push({
+      x: minX,
+      y: minY,
+      w: maxX - minX,
+      h: maxY - minY,
+      spawnX: (minX + maxX) / 2,
+      spawnY: minY - player.r - 4, // spawn just above the checkpoint tiles
+    });
+  }
+
+  // Left-to-right order so "furthest checkpoint reached" is just an index.
+  groups.sort((a, b) => a.x - b.x);
+  return groups;
+}
+
+// ------------------------------------------------------------
+// resolveSolidCollisions()
+// Pushes the player out of any overlapping rock/seaweed tile.
+// Run AFTER handleInput()/applyBounce() so movement this frame
+// has already been applied, then corrected.
+// ------------------------------------------------------------
+function resolveSolidCollisions() {
+  for (const t of solidTiles) {
+    resolveCircleRect(player, t);
+  }
+}
+
+// ------------------------------------------------------------
+// resolveCircleRect()
+// Circle (player) vs axis-aligned rect (tile) overlap + push-out.
+// Mutates p.x / p.y directly so the player can never end up
+// inside a solid tile.
+// ------------------------------------------------------------
+function resolveCircleRect(p, rect) {
+  const closestX = constrain(p.x, rect.x, rect.x + rect.w);
+  const closestY = constrain(p.y, rect.y, rect.y + rect.h);
+
+  const dx = p.x - closestX;
+  const dy = p.y - closestY;
+  const distSq = dx * dx + dy * dy;
+
+  if (distSq >= p.r * p.r) return; // not overlapping
+
+  const d = Math.sqrt(distSq);
+
+  if (d > 0) {
+    // push out along the line from the rect's closest edge point to the player centre
+    const overlap = p.r - d;
+    p.x += (dx / d) * overlap;
+    p.y += (dy / d) * overlap;
+  } else {
+    // player centre is exactly on/inside the rect — push out the shortest way
+    const left = p.x - rect.x;
+    const right = rect.x + rect.w - p.x;
+    const top = p.y - rect.y;
+    const bottom = rect.y + rect.h - p.y;
+    const min = Math.min(left, right, top, bottom);
+
+    if (min === left) p.x = rect.x - p.r;
+    else if (min === right) p.x = rect.x + rect.w + p.r;
+    else if (min === top) p.y = rect.y - p.r;
+    else p.y = rect.y + rect.h + p.r;
+  }
+}
+
+// ------------------------------------------------------------
+// checkHazardCollisions()
+// Spikes kill on contact — same circle-vs-rect overlap test as
+// the solid tiles, but on touch it kills/respawns instead of
+// pushing the player out.
+// ------------------------------------------------------------
+function checkHazardCollisions() {
+  if (player.invincible) return;
+
+  for (const t of hazardTiles) {
+    const closestX = constrain(player.x, t.x, t.x + t.w);
+    const closestY = constrain(player.y, t.y, t.y + t.h);
+    const d = dist(player.x, player.y, closestX, closestY);
+
+    if (d < player.r) {
+      // Respawn the player at the nearest checkpoint (no life loss)
+      respawnFromHazard();
+      break;
+    }
+  }
+}
+
+// ------------------------------------------------------------
+// checkCheckpoints()
+// Activates the furthest checkpoint the player has touched.
+// activeCheckpointIndex only ever moves forward, so walking back
+// over an earlier checkpoint doesn't undo your progress.
+// ------------------------------------------------------------
+function checkCheckpoints() {
+  for (let i = activeCheckpointIndex + 1; i < checkpoints.length; i++) {
+    const cp = checkpoints[i];
+
+    const overlapsX =
+      player.x + player.r > cp.x && player.x - player.r < cp.x + cp.w;
+    const overlapsY =
+      player.y + player.r > cp.y && player.y - player.r < cp.y + cp.h;
+
+    if (overlapsX && overlapsY) {
+      activeCheckpointIndex = i;
+      lastCheckpoint = { x: cp.spawnX, y: cp.spawnY };
+      // Hook a sound/flash/UI message here if you'd like to
+      // celebrate reaching a checkpoint, e.g.:
+      // checkpointSound.play();
+    }
+  }
+}
+
+// ------------------------------------------------------------
+// killPlayer()
+// Shared death handler for spikes (and reusable for enemies/boss
+// attacks later). Loses a life, then either ends the game or
+// respawns at the last checkpoint.
+// ------------------------------------------------------------
+function killPlayer() {
+  player.health--;
+  // playerHitSound.play();
+
+  if (player.health <= 0) {
+    gameState = STATE_OVER;
+    // music.stop();
+    return;
+  }
+
+  respawnPlayer();
+}
+
+// ------------------------------------------------------------
+// respawnPlayer()
+// Moves the player to the last checkpoint reached, or back to
+// the original start position if none has been reached yet.
+// Grants a short invincibility window so they don't immediately
+// die again on the same hazard.
+// ------------------------------------------------------------
+function respawnPlayer() {
+  const spawn =
+    lastCheckpoint ||
+    findClosestPassedCheckpoint(player.x, player.y) ||
+    playerStart;
+
+  player.x = spawn.x;
+  player.y = spawn.y;
+  player.bounceVX = 0;
+  player.bounceVY = 0;
+  player.invincible = true;
+  player.invincibleTimer = INVINCIBLE_FRAMES;
+
+  camX = constrain(player.x - width / 2, 0, WORLD_W - width);
+  camY = constrain(player.y - height / 2, 0, WORLD_H - height);
+}
+
+// ------------------------------------------------------------
+// findClosestPassedCheckpoint()
+// Returns the nearest spawn point among checkpoints the player
+// has already reached, or null if none have been reached.
+// ------------------------------------------------------------
+function findClosestPassedCheckpoint(px, py) {
+  if (activeCheckpointIndex < 0) return null;
+
+  let best = null;
+  let minD = Infinity;
+  for (let i = 0; i <= activeCheckpointIndex && i < checkpoints.length; i++) {
+    const cp = checkpoints[i];
+    const d = dist(px, py, cp.spawnX, cp.spawnY);
+    if (d < minD) {
+      minD = d;
+      best = {
+        x: cp.spawnX,
+        y: cp.spawnY,
+      };
+    }
+  }
+
+  return best;
+}
+
+// ------------------------------------------------------------
+// findClosestCheckpoint()
+// Returns the spawn {x,y} of the nearest checkpoint zone, or
+// the original playerStart if none exist.
+// ------------------------------------------------------------
+function findClosestCheckpoint(px, py) {
+  let best = playerStart;
+  let minD = dist(px, py, playerStart.x, playerStart.y);
+
+  for (const cp of checkpoints) {
+    const d = dist(px, py, cp.spawnX, cp.spawnY);
+    if (d < minD) {
+      minD = d;
+      best = {
+        x: cp.spawnX,
+        y: cp.spawnY,
+      };
+    }
+  }
+
+  return best;
+}
+
+// ------------------------------------------------------------
+// respawnFromHazard()
+// Immediate respawn used for spike contacts: does NOT reduce
+// player health and does NOT grant invincibility (no flicker).
+// Respawns at the nearest passed checkpoint or start.
+// ------------------------------------------------------------
+function respawnFromHazard() {
+  const spawn =
+    findClosestPassedCheckpoint(player.x, player.y) ||
+    lastCheckpoint ||
+    playerStart;
+
+  player.x = spawn.x;
+  player.y = spawn.y;
+  player.bounceVX = 0;
+  player.bounceVY = 0;
+  // no invincibility here — user requested no glitching/flicker
+
+  camX = constrain(player.x - width / 2, 0, WORLD_W - width);
+  camY = constrain(player.y - height / 2, 0, WORLD_H - height);
+}
+
+// ------------------------------------------------------------
+// checkCollectables()
+// Detects overlap with coin tiles and marks them collected.
+// When all coins are collected sets `allCoinsCollected`.
+// ------------------------------------------------------------
+function checkCollectables() {
+  if (coinsTotal === 0 || allCoinsCollected) return;
+
+  for (const layer of tileData.layers) {
+    if (layer.name !== COLLECTABLE_LAYER) continue;
+    for (const t of layer.tiles) {
+      const key = t.x + "," + t.y;
+      if (coinMap.get(key)) continue; // already collected
+
+      const cx = t.x * TILE_SIZE + TILE_SIZE / 2;
+      const cy = t.y * TILE_SIZE + TILE_SIZE / 2;
+      const d = dist(player.x, player.y, cx, cy);
+      if (d < player.r + TILE_SIZE * 0.35) {
+        coinMap.set(key, true);
+        coinsCollected++;
+        if (coinsCollected >= coinsTotal) {
+          allCoinsCollected = true;
+          // hook: unlock door / advance level
+          console.log("All coins collected!");
+        }
+      }
+    }
+  }
+}
+
+// ------------------------------------------------------------
+// checkWhirlpools()
+// Applies a pulling force toward any whirlpool tile the player
+// is near. If the player gets too close they are pulled in.
+// ------------------------------------------------------------
+function checkWhirlpools() {
+  if (!whirlpoolTiles || whirlpoolTiles.length === 0) return;
+
+  for (const t of whirlpoolTiles) {
+    const cx = t.x + t.w / 2;
+    const cy = t.y + t.h / 2;
+    const dx = cx - player.x;
+    const dy = cy - player.y;
+    const d = Math.sqrt(dx * dx + dy * dy);
+
+    const influence = t.w * 2; // radius of effect
+    if (d < influence && d > 0.1) {
+      // pull strength increases as you get closer
+      const pull = map(d, influence, 0, 0.4, 3.0);
+      player.x += (dx / d) * pull;
+      player.y += (dy / d) * pull;
+    }
+
+    // Optional: if the player is extremely close, respawn them
+    if (d < 6) {
+      respawnFromHazard();
+      break;
+    }
+  }
+}
+
+function updateMoveSpeed() {
+  moveSpeed = playerInWater() ? 4 : PLAYER_SPEED;
+}
+
+function playerInWater() {
+  for (const t of waterTiles) {
+    const closestX = constrain(player.x, t.x, t.x + t.w);
+    const closestY = constrain(player.y, t.y, t.y + t.h);
+    if (dist(player.x, player.y, closestX, closestY) < player.r) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function drawTiles(jsonFile) {
+  const layers = jsonFile.layers;
+  let rockPositions = null;
+  if (jsonFile === tileData) {
+    rockPositions = new Set();
+    for (const rockLayer of layers) {
+      if (rockLayer.name === "rock") {
+        for (const tile of rockLayer.tiles) {
+          rockPositions.add(`${tile.x},${tile.y}`);
+        }
+      }
+    }
+  }
+
+  // First pass: draw only water layers
+  for (let l = layers.length - 1; l > -1; l--) {
+    const layer = layers[l];
+    if (layer.name !== "water") continue;
+
+    for (let i = 0; i < layer.tiles.length; i++) {
+      let t = layer.tiles[i];
+      push();
+      let mapXOffset = 0;
+      let mapYOffset = 0;
+      if (jsonFile == fishArea) {
+        mapXOffset = TILE_SIZE * (tileData.mapWidth - 33);
+        mapYOffset = TILE_SIZE * tileData.mapHeight;
+      }
+      let x = t.x * TILE_SIZE + mapXOffset;
+      let y = t.y * TILE_SIZE + mapYOffset;
+      fill(tileColor(layer.name, t.id));
+      rect(x, y, TILE_SIZE, TILE_SIZE);
+      pop();
+    }
+  }
+
+  // Draw background image for fish area after water but before other tiles
+  if (jsonFile === fishArea && fishareaBG) {
+    const fishAreaOffsetX = TILE_SIZE * (tileData.mapWidth - 33);
+    const fishAreaOffsetY = TILE_SIZE * tileData.mapHeight;
+    image(fishareaBG, fishAreaOffsetX, fishAreaOffsetY, 1900, 800);
+  }
+
+  // Second pass: draw all non-water layers
+  for (let l = layers.length - 1; l > -1; l--) {
+    // for each layer we will....
+    const layer = layers[l];
+    if (layer.name === "water") continue; // skip water, already drawn
+    let spikePositions = null;
+    if (jsonFile === tileData && layer.name === "spikes") {
+      spikePositions = new Set(layer.tiles.map((tile) => `${tile.x},${tile.y}`));
+    }
+    for (let i = 0; i < layer.tiles.length; i++) {
+      let t = layer.tiles[i];
+
+      push();
+
+      // drawing map
 
       let mapXOffset = 0; // where the json is in relation to 0,0
       let mapYOffset = 0;
@@ -270,18 +850,164 @@ function drawTiles(jsonFile) {
         mapYOffset = TILE_SIZE * tileData.mapHeight;
       }
 
-      push();
-
       let x = t.x * TILE_SIZE + mapXOffset;
       let y = t.y * TILE_SIZE + mapYOffset;
 
-      if (t.id === "7") {
-        fill("blue"); // water top ... figure this out later
+      // If this is a coin tile and it has been collected, skip drawing it
+      if (layer.name === COLLECTABLE_LAYER) {
+        const key = t.x + "," + t.y;
+        if (coinMap.get(key)) {
+          pop();
+          continue;
+        }
       }
-      rect(x, y, TILE_SIZE, TILE_SIZE);
+
+      // CHANGED — colour now keys off the layer name first (since the
+      // same id number means different things on different layers),
+      // falling back to the old id-based colours for anything else.
+      if (layer.name === COLLECTABLE_LAYER) {
+        fill(tileColor(layer.name, t.id));
+        ellipse(x + TILE_SIZE / 2, y + TILE_SIZE / 2, TILE_SIZE * 0.6);
+      } else if (layer.name === WHIRLPOOL_LAYER) {
+        fill(tileColor(layer.name, t.id));
+        rect(x, y, TILE_SIZE, TILE_SIZE, TILE_SIZE * 0.25);
+        fill(10, 50, 120, 160);
+        ellipse(x + TILE_SIZE / 2, y + TILE_SIZE / 2, TILE_SIZE * 0.6);
+      } else if (jsonFile === fishArea && layer.name === "sand") {
+        if (sandImg) {
+          image(sandImg, x, y, TILE_SIZE, TILE_SIZE);
+        } else {
+          fill(tileColor(layer.name, t.id));
+          rect(x, y, TILE_SIZE, TILE_SIZE);
+        }
+      } else if (jsonFile === fishArea && layer.name === "rock") {
+        if (sandrockImg) {
+          image(sandrockImg, x, y, TILE_SIZE, TILE_SIZE);
+        } else {
+          fill(tileColor(layer.name, t.id));
+          rect(x, y, TILE_SIZE, TILE_SIZE);
+        }
+      } else if (jsonFile === tileData && layer.name === "rock") {
+        if (rockImg) {
+          image(rockImg, x, y, TILE_SIZE, TILE_SIZE);
+        } else {
+          fill(tileColor(layer.name, t.id));
+          rect(x, y, TILE_SIZE, TILE_SIZE);
+        }
+      } else if (jsonFile === tileData && layer.name === "spikes") {
+        const leftNeighbor = spikePositions.has(`${t.x - 1},${t.y}`);
+        const rightNeighbor = spikePositions.has(`${t.x + 1},${t.y}`);
+        const rockAbove = rockPositions.has(`${t.x},${t.y - 1}`);
+        const rockLeft = rockPositions.has(`${t.x - 1},${t.y}`);
+        const rockRight = rockPositions.has(`${t.x + 1},${t.y}`);
+        const rockBelow = rockPositions.has(`${t.x},${t.y + 1}`);
+
+        let spikeImg = spike3Img;
+        if (leftNeighbor) {
+          spikeImg = spike2Img;
+        } else if (rightNeighbor) {
+          spikeImg = spike1Img;
+        } else {
+          const posHash = (t.x + t.y * 7) % 2;
+          if (rockAbove) {
+            spikeImg = posHash === 0 ? spike3Img : spike4Img;
+          } else {
+            spikeImg = posHash === 0 ? spike4Img : spike3Img;
+          }
+        }
+
+        let rotation = 0;
+        if (!rockBelow) {
+          if (rockAbove) {
+            rotation = PI;
+          } else if (rockLeft) {
+            rotation = HALF_PI;
+          } else if (rockRight) {
+            rotation = -HALF_PI;
+          }
+        }
+
+        if (spikeImg) {
+          push();
+          translate(x + TILE_SIZE / 2, y + TILE_SIZE / 2);
+          rotate(rotation);
+          imageMode(CENTER);
+          image(spikeImg, 0, 0, TILE_SIZE, TILE_SIZE);
+          imageMode(CORNER);
+          pop();
+        } else {
+          fill(tileColor(layer.name, t.id));
+          rect(x, y, TILE_SIZE, TILE_SIZE);
+        }
+      } else if (layer.name === "seaweed") {
+        if (seaweedImg) {
+          image(seaweedImg, x, y, TILE_SIZE, TILE_SIZE);
+        } else {
+          fill(tileColor(layer.name, t.id));
+          rect(x, y, TILE_SIZE, TILE_SIZE);
+        }
+      } else {
+        fill(tileColor(layer.name, t.id));
+        rect(x, y, TILE_SIZE, TILE_SIZE);
+      }
 
       pop();
     }
+  }
+}
+
+// ------------------------------------------------------------
+// ADDED — tileColor()
+// Centralises tile colour lookup by layer name. Swap any of
+// these for image()/sprite drawing later without touching the
+// physics code above.
+// ------------------------------------------------------------
+function tileColor(layerName, id) {
+  switch (layerName) {
+    case "spikes":
+      return color(200, 40, 40); // red — danger
+    case "checkpoint":
+      return color(255, 215, 0); // gold — flag
+    case "rock":
+      return color(90, 90, 90); // grey — solid
+    case "seaweed":
+      return color(40, 140, 60); // green — solid
+    case "coins":
+      return color(255, 215, 0); // gold coin
+    case "whirlpool":
+      return color(30, 100, 200); // blue whirlpool
+    case "water":
+      return color(20, 60, 160, 160); // blue — background
+    case "bg green":
+      return color(140, 200, 140, 160); // pale green — background
+  }
+
+  // fallback: old id-based colours, for any layer name not listed above
+  switch (id) {
+    case "0":
+      return color("gray");
+    case "1":
+      return color("lightblue");
+    case "2":
+      return color("purple");
+    case "3":
+      return color("orange");
+    case "4":
+      return color("yellow");
+    case "5":
+      return color(0);
+    case "6":
+      return color(0, 0, 200);
+    case "7":
+      return color("blue");
+    case "8":
+      return color(80, 80, 100);
+    case "9":
+      return color(200, 240, 255);
+    case "10":
+      return color("pink");
+    default:
+      return color("green");
   }
 }
 
@@ -307,21 +1033,19 @@ function drawObstacles() {
     let y = o.y - o.size / 2;
     let s = o.size;
 
-    // Animated glow — pulses using sin(frameCount)
-    let glow = map(sin(frameCount * 0.05 + i * 1.2), -1, 1, 40, 90);
-
     push();
+
+    pop();
   }
 }
 
 // ------------------------------------------------------------
 // checkObstaclePlayerCollision()
 // Circle-rectangle overlap test — same as Example 1.
-// Player bounces away and loses health on contact.
+// Obstacle contact is no longer harmful; obstacles are treated
+// like a reward/interaction point instead of a death hazard.
 // ------------------------------------------------------------
 function checkObstaclePlayerCollision() {
-  if (player.invincible) return;
-
   for (let i = 0; i < obstacles.length; i++) {
     let o = obstacles[i];
 
@@ -330,24 +1054,14 @@ function checkObstaclePlayerCollision() {
     let d = dist(player.x, player.y, closestX, closestY);
 
     if (d < player.r) {
-      player.health--;
-      player.invincible = true;
-      player.invincibleTimer = INVINCIBLE_FRAMES;
-
-      // Bounce direction — away from obstacle centre
+      // Keep a small bounce off obstacles for feedback,
+      // but do not reduce health or end the game.
       let dx = player.x - o.x;
       let dy = player.y - o.y;
       let len = dist(0, 0, dx, dy);
       if (len > 0) {
         player.bounceVX = (dx / len) * 8;
         player.bounceVY = (dy / len) * 8;
-      }
-
-      // playerHitSound.play();
-
-      if (player.health <= 0) {
-        gameState = STATE_OVER;
-        // music.stop();
       }
       break;
     }
@@ -375,6 +1089,8 @@ function applyBounce() {
 // Draws background shapes in world coordinates.
 // ------------------------------------------------------------
 function drawBackground() {
+  noStroke();
+
   // World boundary outline
   noFill();
   stroke(60, 50, 80);
@@ -391,19 +1107,19 @@ function drawBackground() {
 // ------------------------------------------------------------
 function handleInput() {
   if (keyIsDown(87)) {
-    player.y -= PLAYER_SPEED;
+    player.y -= moveSpeed;
     player.direction = { x: 0, y: -1 };
   }
   if (keyIsDown(83)) {
-    player.y += PLAYER_SPEED;
+    player.y += moveSpeed;
     player.direction = { x: 0, y: 1 };
   }
   if (keyIsDown(65)) {
-    player.x -= PLAYER_SPEED;
+    player.x -= moveSpeed;
     player.direction = { x: -1, y: 0 };
   }
   if (keyIsDown(68)) {
-    player.x += PLAYER_SPEED;
+    player.x += moveSpeed;
     player.direction = { x: 1, y: 0 };
   }
 
@@ -527,32 +1243,5 @@ function keyPressed() {
     if (!boss) spawnBoss();
   }
 
-  // R — restart
-  if (
-    (key === "r" || key === "R") &&
-    gameState !== STATE_PLAY &&
-    gameState !== STATE_BOSS
-  ) {
-    gameState = STATE_PLAY;
-    score = 0;
-    nextWave = 0;
-    bullets = [];
-    enemies = [];
-    boss = null;
-
-    player.x = WORLD_W / 2;
-    player.y = WORLD_H - 200;
-    player.direction = { x: 0, y: -1 };
-    player.shootTimer = 0;
-    player.health = player.maxHealth;
-    player.invincible = false;
-    player.invincibleTimer = 0;
-    player.bounceVX = 0;
-    player.bounceVY = 0;
-
-    camX = player.x - width / 2;
-    camY = player.y - height / 2;
-
-    // music.loop();
-  }
+  // music.loop();
 }
