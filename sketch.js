@@ -74,6 +74,15 @@ let tileData;
 let tiles = [];
 
 let waterTiles = [];
+let seaweedImg;
+let sandImg;
+let sandrockImg;
+let rockImg;
+let spike1Img;
+let spike2Img;
+let spike3Img;
+let spike4Img;
+let fishareaBG;
 
 let fishArea;
 
@@ -160,6 +169,15 @@ function preload() {
   obstacleData = loadJSON("data/obstacles.json");
   tileData = loadJSON("data/map.json");
   fishArea = loadJSON("data/fisharea.json");
+  seaweedImg = loadImage("assets/seaweed.png");
+  sandImg = loadImage("assets/sand.png");
+  sandrockImg = loadImage("assets/sandrock.png");
+  rockImg = loadImage("assets/rock.png");
+  spike1Img = loadImage("assets/spike1.png");
+  spike2Img = loadImage("assets/spike2.png");
+  spike3Img = loadImage("assets/spike3.png");
+  spike4Img = loadImage("assets/spike4.png");
+  fishareaBG = loadImage("assets/fishareaBG.png");
 
   // Uncomment to load sounds:
   // shootSound     = loadSound("assets/sounds/shoot.wav");
@@ -767,9 +785,56 @@ function playerInWater() {
 
 function drawTiles(jsonFile) {
   const layers = jsonFile.layers;
+  let rockPositions = null;
+  if (jsonFile === tileData) {
+    rockPositions = new Set();
+    for (const rockLayer of layers) {
+      if (rockLayer.name === "rock") {
+        for (const tile of rockLayer.tiles) {
+          rockPositions.add(`${tile.x},${tile.y}`);
+        }
+      }
+    }
+  }
+
+  // First pass: draw only water layers
+  for (let l = layers.length - 1; l > -1; l--) {
+    const layer = layers[l];
+    if (layer.name !== "water") continue;
+
+    for (let i = 0; i < layer.tiles.length; i++) {
+      let t = layer.tiles[i];
+      push();
+      let mapXOffset = 0;
+      let mapYOffset = 0;
+      if (jsonFile == fishArea) {
+        mapXOffset = TILE_SIZE * (tileData.mapWidth - 33);
+        mapYOffset = TILE_SIZE * tileData.mapHeight;
+      }
+      let x = t.x * TILE_SIZE + mapXOffset;
+      let y = t.y * TILE_SIZE + mapYOffset;
+      fill(tileColor(layer.name, t.id));
+      rect(x, y, TILE_SIZE, TILE_SIZE);
+      pop();
+    }
+  }
+
+  // Draw background image for fish area after water but before other tiles
+  if (jsonFile === fishArea && fishareaBG) {
+    const fishAreaOffsetX = TILE_SIZE * (tileData.mapWidth - 33);
+    const fishAreaOffsetY = TILE_SIZE * tileData.mapHeight;
+    image(fishareaBG, fishAreaOffsetX, fishAreaOffsetY, 1900, 800);
+  }
+
+  // Second pass: draw all non-water layers
   for (let l = layers.length - 1; l > -1; l--) {
     // for each layer we will....
     const layer = layers[l];
+    if (layer.name === "water") continue; // skip water, already drawn
+    let spikePositions = null;
+    if (jsonFile === tileData && layer.name === "spikes") {
+      spikePositions = new Set(layer.tiles.map((tile) => `${tile.x},${tile.y}`));
+    }
     for (let i = 0; i < layer.tiles.length; i++) {
       let t = layer.tiles[i];
 
@@ -800,29 +865,91 @@ function drawTiles(jsonFile) {
       // CHANGED — colour now keys off the layer name first (since the
       // same id number means different things on different layers),
       // falling back to the old id-based colours for anything else.
-      fill(tileColor(layer.name, t.id));
       if (layer.name === COLLECTABLE_LAYER) {
-        // draw coin as a circle centered in the tile
+        fill(tileColor(layer.name, t.id));
         ellipse(x + TILE_SIZE / 2, y + TILE_SIZE / 2, TILE_SIZE * 0.6);
       } else if (layer.name === WHIRLPOOL_LAYER) {
-        // draw whirlpool as a rounded rect with darker centre
+        fill(tileColor(layer.name, t.id));
         rect(x, y, TILE_SIZE, TILE_SIZE, TILE_SIZE * 0.25);
         fill(10, 50, 120, 160);
         ellipse(x + TILE_SIZE / 2, y + TILE_SIZE / 2, TILE_SIZE * 0.6);
+      } else if (jsonFile === fishArea && layer.name === "sand") {
+        if (sandImg) {
+          image(sandImg, x, y, TILE_SIZE, TILE_SIZE);
+        } else {
+          fill(tileColor(layer.name, t.id));
+          rect(x, y, TILE_SIZE, TILE_SIZE);
+        }
+      } else if (jsonFile === fishArea && layer.name === "rock") {
+        if (sandrockImg) {
+          image(sandrockImg, x, y, TILE_SIZE, TILE_SIZE);
+        } else {
+          fill(tileColor(layer.name, t.id));
+          rect(x, y, TILE_SIZE, TILE_SIZE);
+        }
+      } else if (jsonFile === tileData && layer.name === "rock") {
+        if (rockImg) {
+          image(rockImg, x, y, TILE_SIZE, TILE_SIZE);
+        } else {
+          fill(tileColor(layer.name, t.id));
+          rect(x, y, TILE_SIZE, TILE_SIZE);
+        }
+      } else if (jsonFile === tileData && layer.name === "spikes") {
+        const leftNeighbor = spikePositions.has(`${t.x - 1},${t.y}`);
+        const rightNeighbor = spikePositions.has(`${t.x + 1},${t.y}`);
+        const rockAbove = rockPositions.has(`${t.x},${t.y - 1}`);
+        const rockLeft = rockPositions.has(`${t.x - 1},${t.y}`);
+        const rockRight = rockPositions.has(`${t.x + 1},${t.y}`);
+        const rockBelow = rockPositions.has(`${t.x},${t.y + 1}`);
+
+        let spikeImg = spike3Img;
+        if (leftNeighbor) {
+          spikeImg = spike2Img;
+        } else if (rightNeighbor) {
+          spikeImg = spike1Img;
+        } else {
+          const posHash = (t.x + t.y * 7) % 2;
+          if (rockAbove) {
+            spikeImg = posHash === 0 ? spike3Img : spike4Img;
+          } else {
+            spikeImg = posHash === 0 ? spike4Img : spike3Img;
+          }
+        }
+
+        let rotation = 0;
+        if (!rockBelow) {
+          if (rockAbove) {
+            rotation = PI;
+          } else if (rockLeft) {
+            rotation = HALF_PI;
+          } else if (rockRight) {
+            rotation = -HALF_PI;
+          }
+        }
+
+        if (spikeImg) {
+          push();
+          translate(x + TILE_SIZE / 2, y + TILE_SIZE / 2);
+          rotate(rotation);
+          imageMode(CENTER);
+          image(spikeImg, 0, 0, TILE_SIZE, TILE_SIZE);
+          imageMode(CORNER);
+          pop();
+        } else {
+          fill(tileColor(layer.name, t.id));
+          rect(x, y, TILE_SIZE, TILE_SIZE);
+        }
+      } else if (layer.name === "seaweed") {
+        if (seaweedImg) {
+          image(seaweedImg, x, y, TILE_SIZE, TILE_SIZE);
+        } else {
+          fill(tileColor(layer.name, t.id));
+          rect(x, y, TILE_SIZE, TILE_SIZE);
+        }
       } else {
+        fill(tileColor(layer.name, t.id));
         rect(x, y, TILE_SIZE, TILE_SIZE);
       }
-
-      if (jsonFile == fishArea) {
-        mapXOffset = TILE_SIZE * (tileData.mapWidth - 33);
-        mapYOffset = TILE_SIZE * tileData.mapHeight;
-      }
-
-      // push();
-
-      rect(x, y, TILE_SIZE, TILE_SIZE);
-
-      // pop();
 
       pop();
     }
